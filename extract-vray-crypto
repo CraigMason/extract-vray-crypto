@@ -1,0 +1,149 @@
+#!/usr/bin/python3
+
+import sys
+import os
+import re
+
+import numpy as np
+import OpenImageIO as oiio
+from OpenImageIO import ImageInput, ImageOutput
+from OpenImageIO import ImageBuf, ImageSpec, ImageBufAlgo
+
+def extract_cryptomattes(input_file, output_file):
+
+    input_buf = ImageBuf(input_file)
+
+    input_buf.read(0)
+    input_spec = input_buf.spec()
+
+    # Create a new output buffer, and fill the known named red, green, blue, A channels with black.
+    # This reserves those channel names so that OIIO will prefix future channel appends with the requisite
+    # subimage name. We will delete these channels before writing to disk
+    output_buf = ImageBuf(input_spec)
+    output_buf = ImageBufAlgo.channels(input_buf, (-1, -1, -1, -1), ("red", "green", "blue", "A"))
+
+    # Track the output formats so we write the correct per-channel depth later (thanks to @Larry Gritz for the pointer)
+    output_formats = ()
+    found_mattes = 0
+
+    for sub_index in range(input_buf.nsubimages):
+
+        input_buf.read(sub_index)
+        sub_spec = input_buf.spec()
+
+        subimage_name = sub_spec.get_string_attribute("oiio:subimagename", "")
+
+        if subimage_name.find("VRayCryptomatte") != -1:
+
+            print(f"Subimage {sub_index} contains cryptomatte layer: {subimage_name}, with depth {sub_spec.format}")
+
+            # OIIO stores channels internally as float. We save the depth so we can use the correct format at output time
+            new_formats = (str(input_buf.nativespec().format),) * sub_spec.nchannels
+            output_formats = output_formats + new_formats
+
+            output_buf = ImageBufAlgo.channel_append(output_buf, input_buf)
+
+            found_mattes = 1
+
+    if found_mattes:
+
+        # Remove the red, green, blue, A channels as these are not needed
+        to_delete = get_indices(output_buf.spec().channelnames, ("red", "green", "blue", "A"))
+        cur_channels = list(range(output_buf.spec().nchannels))
+        new_channels = tuple(filter(lambda x: x not in to_delete, cur_channels))
+
+
+        # Delete t
+        ImageBufAlgo.channels(output_buf, output_buf, new_channels, ())
+
+        # Save the output buffer
+        output_buf.set_write_format(output_formats)
+        output_buf.write(output_file)
+        print(f"Saved multichannel Cryptomattes + metadata to {output_file}")
+    else:
+        print(f"Did not find any VRay Cryptomatte sub-images as part of a multi-part EXR file")
+
+
+def get_indices(lst, targets):
+    return [index for index, element in enumerate(lst) if element in targets]
+
+
+def get_num_zeros(pattern):
+    regex = re.compile(r'(#+)')
+    matches = regex.search(pattern)
+    if matches:
+        return len(matches.group(1))
+    else:
+        return 0
+
+def extract_cryptomattes_pattern(in_file, out_file, num_zeros):
+    in_parts = re.sub(r'#+', r'#', in_file).split(r'#')
+    out_parts = re.sub(r'#+', r'#', out_file).split(r'#')
+
+    largest = int(r'9' * num_zeros);
+
+    for i in range(0, largest+1):
+        str_i = str(i).zfill(num_zeros)
+        src_file = f"{in_parts[0]}{str_i}{in_parts[1]}"
+        dst_file = f"{out_parts[0]}{str_i}{out_parts[1]}"
+
+        # print(f"Extracting {src_file} to {dst_file}")
+        extract_cryptomattes(src_file, dst_file)
+
+
+def main():
+
+    if len(sys.argv) == 1 or ( len(sys.argv) == 2 and (sys.argv[1] == '-h' or sys.argv[1] == '--help')):
+        print(r"""Extracts VRay-generated Cryptomattes from an EXR 2.0 multipart file and outputs an EXR 1.0 single-part file with all Cryptomatte parts into channels.
+Uses OpenImageIO. Primarily used to create Resolve / Fusion compatible Cryptomattes.
+
+Supports images sequences using hash-based numbering, e.g.
+extract-vray-crypto input.####.exr output.####.exr
+
+Input and output must have the same number of hashes.
+""")
+        return
+
+    # Check if the correct number of arguments are provided
+    if len(sys.argv) < 3:
+        print(r'''Usage:
+    extract-vray-crypto infile.exr outfile.exr
+or
+    extract-vray-crypto infile.####.exr outfile.####.exr''')
+        return
+
+    in_file = sys.argv[1]
+    out_file = sys.argv[2]
+
+    # Check if the extensions are '.exr'
+    if not in_file.endswith('.exr'):
+        print(f"Error: File '{in_file}' does not have a '.exr' extension.")
+        return
+    if not out_file.endswith('.exr'):
+        print(f"Error: File '{out_file}' does not have a '.exr' extension.")
+        return
+
+    if in_file == out_file:
+        print(f"input and output file cannot be the same")
+        return
+
+    if r'#' in in_file:
+        num_zeros_in = get_num_zeros(in_file)
+        num_zeros_out = get_num_zeros(out_file)
+        if num_zeros_in == 0 or num_zeros_out == 0 or num_zeros_in != num_zeros_out:
+            print(f"{in_file} and {out_file} zero padding does not match. The number of hashes must be the same ({num_zeros_in}).")
+            return
+        extract_cryptomattes_pattern(in_file, out_file, num_zeros_in)
+        return
+    else:
+        # Check if the first file exists
+        if not os.path.exists(in_file):
+            print(f"Error: File '{in_file}' does not exist.")
+            return
+
+        extract_cryptomattes(in_file, out_file)
+        return
+
+
+if __name__ == "__main__":
+    main()
